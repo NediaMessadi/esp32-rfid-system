@@ -28,6 +28,7 @@ unsigned long scanTime = 0;
 bool waitingRelease = false;
 bool loadingDone = false;
 bool travailEnCours = false;
+bool projectIsPending = false;
 int scanId = 0;
 int currentScanId = 0;
 int pendingDecisionScanId = 0;
@@ -39,6 +40,9 @@ String projetNom = "";
 String tempsRestant = "";
 String tempsEstime = "";
 String checklistData = "";
+String nextProjectName = "";
+int taskState[4] = {0,0,0,0};
+String pendingTasksMessage = "";
 unsigned long lastDisplayTime = 0;
 unsigned long long projectDueTimestamp = 0;
 unsigned long lastCountdownUpdate = 0;
@@ -49,9 +53,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void setRGB(int rgbIndex, bool r, bool g, bool b);
 void drawProjectDynamicData();
 // ─── Réseau & MQTT ──────────────────────────────────────────
-const char* ssid          = "Cafe SEVEN";
-const char* password      = "20262026";
-const char* mqtt_server = "192.168.0.151";
+const char* ssid          = "Cafe SEVEN Mez";
+const char* password      = "987654321";
+const char* mqtt_server = "192.168.0.241";
 const uint16_t mqttPort   = 1883;
 const char* mqttTopicScan = "pointage/action";
 const char* mqttTopicButton   = "pointage/button";
@@ -60,6 +64,9 @@ const char* mqttTopicStatus   = "pointage/status";
 const char* mqttTopicFinish = "pointage/finish";
 const char* mqttTopicProject = "pointage/project";
 const char* mqttTopicTasks = "pointage/tasks";
+const char* mqttTopicSyncReq = "pointage/sync_request";
+const char* mqttTopicFinishResult = "pointage/finish_result";
+const char* mqttTopicNextProject = "pointage/next_project";
 // ─── NTP ────────────────────────────────────────────────────
 const char* ntpServer        = "pool.ntp.org";
 const long  gmtOffset_sec    = 3600;
@@ -93,6 +100,7 @@ MFRC522     rfid(RFID_CS, RFID_RST);
 TFT_eSPI    tft = TFT_eSPI();
 WiFiClient  mqttWifiClient;
 PubSubClient client(mqttWifiClient);
+bool projectScreenActive = false;
 Adafruit_MCP23X17 mcp;
 
 // ─── État machine ───────────────────────────────────────────
@@ -157,7 +165,7 @@ void disableAll() {
 
 void selectTFT() {
   digitalWrite(RFID_CS, HIGH);
-  digitalWrite(SD_CS,   HIGH);
+  digitalWrite(SD_CS,   HIGH);  
   digitalWrite(TFT_CS,  LOW);
 }
 
@@ -191,11 +199,17 @@ uint32_t read32(File& f) {
 }
 
 void drawBmp(const char* filename) {
-
+  SPI.setFrequency(10000000);   // ← SD à 10MHz avant toute lecture
   selectSD();
-
   File bmpFile = SD.open(filename);
-
+  if (bmpFile) {
+  Serial.print("[DEBUG] File size: ");
+  Serial.println(bmpFile.size());
+  uint8_t buf[4];
+  bmpFile.read(buf, 4);
+  Serial.printf("[DEBUG] Header bytes: %02X %02X %02X %02X\n", buf[0], buf[1], buf[2], buf[3]);
+  bmpFile.seek(0);  // remettre au début
+}
   if (!bmpFile) {
     Serial.print("[TFT] BMP open failed: ");
     Serial.println(filename);
@@ -209,7 +223,6 @@ void drawBmp(const char* filename) {
     Serial.println("[TFT] Invalid BMP header");
 
     bmpFile.close();
-
     disableAll();
     return;
   }
@@ -263,28 +276,16 @@ void drawBmp(const char* filename) {
     // Lecture SD
     // =========================
 
+  // APRÈS
     selectSD();
-
     for (int r = 0; r < chunkRows; r++) {
-
-      uint8_t* rowPtr =
-          &bmpSDBuffer[r * w * 3];
-
+      uint8_t* rowPtr = &bmpSDBuffer[r * w * 3];
       bmpFile.read(rowPtr, w * 3);
-
       if (padding) {
-
-        bmpFile.seek(
-            bmpFile.position() + padding
-        );
+        bmpFile.seek(bmpFile.position() + padding);
       }
     }
-
     digitalWrite(SD_CS, HIGH);
-
-    // =========================
-    // RGB888 → RGB565
-    // =========================
 
     for (int r = 0; r < chunkRows; r++) {
 
@@ -302,12 +303,10 @@ void drawBmp(const char* filename) {
       }
     }
 
-    // =========================
-    // Affichage TFT
-    // =========================
 
+    // APRÈS
+    SPI.setFrequency(40000000);   // ← TFT à 40MHz avant écriture
     selectTFT();
-
     tft.startWrite();
 
     for (int r = 0; r < chunkRows; r++) {
@@ -324,21 +323,16 @@ void drawBmp(const char* filename) {
     }
 
     tft.endWrite();
-
     disableAll();
   }
-
-
+ // APRÈS
   bmpFile.close();
-
   disableAll();
+  // ← rien d'autre, SD reste valide
 }
 void drawTaskTick(int x, int y, int size, uint16_t color) {
-  // ✅ Tick ✓ épais et visible dans la case
-  int cx = x + size / 2;  // centre X de la case
-  int cy = y + size / 2;  // centre Y de la case
-
-  // Branche gauche du tick (bas-gauche → centre-bas)
+  int cx = x + size / 2;  
+  int cy = y + size / 2;  
   int ax = cx - size / 3;
   int ay = cy;
   int bx = cx - size / 8;
@@ -354,12 +348,11 @@ void drawTaskTick(int x, int y, int size, uint16_t color) {
     tft.drawLine(bx, by + t, dx, dy + t, color);
   }
 }
-// ============================================================
-//  Écran principal
-// ============================================================
 
 void showMainScreen() {
   drawBmp("/a.bmp");
+  projectScreenActive = false;
+  travailEnCours      = false;
   screenState      = SCREEN_MAIN;
   screenStateSince = millis();
   loadingDone = false;
@@ -396,29 +389,34 @@ void drawLoadingBar(int progress) {
 
   disableAll();
 }
+// APRÈS
 void showLoading() {
   drawBmp("/b.bmp");
-
-  // animation 1 seconde
+  disableAll();                  // ← AJOUT : état propre avant animation
   for (int i = 0; i <= 100; i += 3) {
     drawLoadingBar(i);
-    delay(20); // 1000ms total (1 seconde)
+    // client.loop() retiré ici — trop risqué pendant animation SPI
+    yield();
+    delay(20);
   }
-
- int duration = 500; // 0.5 seconde
- int steps = 50;
+  int duration = 500;
+  int steps = 50;
+  for (int i = 0; i <= steps; i++) {
+    int progress = map(i, 0, steps, 0, 100);
+    drawLoadingBar(progress);
+    yield();
+    delay(duration / steps);
+  }
 
  for (int i = 0; i <= steps; i++) {
   int progress = map(i, 0, steps, 0, 100);
   drawLoadingBar(progress);
+  client.loop();
+  yield();
   delay(duration / steps);
 }
 }
 
-
-// ============================================================
-//  RFID helpers
-// ============================================================
 
 String readUid() {
   String uid = "";
@@ -439,9 +437,6 @@ bool getCurrentTime(String& timeValue) {
   return true;
 }
 
-// ============================================================
-//  Overlay résultat TFT
-// ============================================================
 
 void drawResultOverlay() {
   selectTFT();
@@ -469,10 +464,6 @@ void drawResultOverlay() {
   disableAll();
 }
 
-// ============================================================
-//  Buzzer (non-bloquant)
-// ============================================================
-
 void startBuzzer(unsigned long durationMs) {
   buzzerActive    = true;
   buzzerUntil     = millis() + durationMs;
@@ -498,10 +489,6 @@ void updateBuzzer() {
   }
 }
 
-// ============================================================
-//  MQTT — publication boutons
-// ============================================================
-
 void sendButtonStatus(const String& uid, const String& action) {
   if (!client.connected()) return;
   String payload = uid + "|" + action;
@@ -511,126 +498,280 @@ void sendButtonStatus(const String& uid, const String& action) {
   Serial.println(ok ? " -> sent" : " -> publish-failed");
 }
 
-// ============================================================
-//  MQTT — callback décision serveur
-//  Format attendu : UID|Nom Prenom|etat
-// ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+if (length == 0) return;
 
-  // ✅ Message construit EN PREMIER
-  String message;
-  for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
+String message;
 
-  // =========================
-  // FINISH
-  // =========================
-  if (String(topic) == "pointage/finish") {
-    Serial.println("[MQTT] Projet terminé");
-    travailEnCours = false;
-    showingError   = false;      // ✅ AJOUTÉ
-    btn1Pressed    = false;      // ✅ AJOUTÉ
-    btn2Pressed    = false;      // ✅ AJOUTÉ
-    lastBtn1       = BTN_RELEASED; // ✅ AJOUTÉ
-    lastBtn2       = BTN_RELEASED; // ✅ AJOUTÉ
-    showMainScreen();
-    return;
-  }
+for (unsigned int i = 0; i < length; i++) {
+message += (char)payload[i];
+}
 
-  // =========================
-  // TASKS
-  // =========================
-  if (String(topic) == "pointage/tasks") {
-    Serial.println("[TASKS] " + message);
-
-    int f1 = 0, f2 = 0, f3 = 0, f4 = 0;
-    sscanf(message.c_str(), "%d|%d|%d|%d", &f1, &f2, &f3, &f4);
-
-    // ── Coordonnées exactes des cases sur f.bmp ───────────────
-    const int BOX_X    = 22;  // ✅ coin gauche des cases
-    const int BOX_SIZE = 20;  // ✅ taille case
-    const int Y1 = 133;       // ✅ Finaliser
-    const int Y2 = 168;       // ✅ Vérifier
-    const int Y3 = 203;       // ✅ Envoyer
-    const int Y4 = 238;       // ✅ Commander
-
-    selectTFT();
-
-    // ✅ Redessiner tous les ticks cochés à chaque update
-    if (f1 == 1) drawTaskTick(BOX_X, Y1, BOX_SIZE, TFT_GREEN);
-    if (f2 == 1) drawTaskTick(BOX_X, Y2, BOX_SIZE, TFT_GREEN);
-    if (f3 == 1) drawTaskTick(BOX_X, Y3, BOX_SIZE, TFT_GREEN);
-    if (f4 == 1) drawTaskTick(BOX_X, Y4, BOX_SIZE, TFT_GREEN);
-
-    disableAll();
-
-    // ── RGB LEDs ──────────────────────────────────────────────
-    for (int i = 0; i < 4; i++) setRGB(i, false, false, false);
-    if (f1 == 1) setRGB(0, false, false, true);
-    if (f2 == 1) setRGB(1, true,  false, false);
-    if (f3 == 1) setRGB(2, false, true,  false);
-    if (f4 == 1) setRGB(3, false, false, true);
-    return;
-  }
-
-  // =========================
-  // PROJET
-  // =========================
-  if (String(topic) == "pointage/project") {
-    Serial.println("[MQTT PROJECT] " + message);
-
-    int p1 = message.indexOf('|');
-    int p2 = message.indexOf('|', p1 + 1);
-
-    projetNom   = message.substring(0, p1);
-    tempsEstime = message.substring(p1 + 1, p2);
-    projectDueTimestamp = strtoull(
-      message.substring(p2 + 1).c_str(), NULL, 10
-    );
-
-    Serial.println("[PROJECT] " + projetNom);
-    return;
-  }
-
-  // =========================
-  // DÉCISION POINTAGE
-  // =========================
-  Serial.println("[MQTT] " + message);
+if (String(topic) == mqttTopicDecision) {
 
   int p1 = message.indexOf('|');
   int p2 = message.indexOf('|', p1 + 1);
-  int p3 = message.lastIndexOf('|');
+  int p3 = message.indexOf('|', p2 + 1);
 
-  if (p1 < 0 || p2 < 0) return;
-
-  String uid  = message.substring(0, p1);        uid.trim();
-  String name = message.substring(p1 + 1, p2);   name.trim();
-  String state;
-  int receivedScanId = 0;
-
-  if (p3 == p2) {
-    state = message.substring(p2 + 1);
-  } else {
-    state          = message.substring(p2 + 1, p3);
-    receivedScanId = message.substring(p3 + 1).toInt();
+  if (p1 < 0 || p2 < 0 || p3 < 0) {
+    Serial.println("[MQTT] decision format invalide");
+    return;
   }
 
-  state.trim();
-  state.toLowerCase();
+  String incomingUid     = message.substring(0, p1);
+  String incomingName    = message.substring(p1 + 1, p2);
+  String incomingState   = message.substring(p2 + 1, p3);
+  String incomingScanId  = message.substring(p3 + 1);
 
-  Serial.println("[DEBUG] state=" + state + "=");
+  incomingUid.trim();
+  incomingState.trim();
 
-  pendingDecisionUid    = uid;
-  pendingDecisionState  = state;
-  pendingDecisionScanId = receivedScanId;
-  lastScannedName       = name;
-  pendingDecision       = true;
+  if (incomingUid != lastScannedUid) {
+    Serial.println("[MQTT] UID mismatch — ignoré");
+    return;
+  }
+
+  pendingDecisionUid = incomingUid;
+  pendingDecisionState = incomingState;
+  pendingDecisionScanId = incomingScanId.toInt();
+
+  lastScannedName = incomingName;
+
+  pendingDecision = true;
+
+  Serial.println("[MQTT] Decision reçue: " + incomingState);
+
+  return;
 }
-// ============================================================
-//  Connectivité WiFi
-// ============================================================
 
+if (String(topic) == mqttTopicTasks) {
+int f1=0, f2=0, f3=0, f4=0;
+
+sscanf(message.c_str(),
+       "%d|%d|%d|%d",
+       &f1, &f2, &f3, &f4);
+
+// cache
+taskState[0]=f1;
+taskState[1]=f2;
+taskState[2]=f3;
+taskState[3]=f4;
+
+Serial.println("[TASKS] " + message);
+
+// si f.bmp pas encore affiché
+if (!projectScreenActive)
+  return;
+
+const int YS[4] = {133,168,203,238};
+int vals[4] = {f1,f2,f3,f4};
+selectTFT();
+for (int i=0; i<4; i++) {
+  if (vals[i]==0) {
+    // effacer uniquement les cases décochées
+    uint16_t c = tft.readPixel(23, YS[i]+21);
+    c = (c >> 8) | (c << 8); // swap bytes
+   tft.fillRect(22, YS[i], 20, 20, c);
+  }
+}
+if (f1==1) drawTaskTick(22,133,20,TFT_GREEN);
+if (f2==1) drawTaskTick(22,168,20,TFT_GREEN);
+if (f3==1) drawTaskTick(22,203,20,TFT_GREEN);
+if (f4==1) drawTaskTick(22,238,20,TFT_GREEN);
+
+disableAll();
+
+// reset LEDs
+for (int i=0; i<4; i++) {
+  setRGB(i,false,false,false);
+}
+
+// rallumer bons RGB
+if (f1==1) setRGB(0,false,false,true);
+if (f2==1) setRGB(1,true,false,false);
+if (f3==1) setRGB(2,false,true,false);
+if (f4==1) setRGB(3,false,false,true);
+
+return;
+
+}
+// =========================
+// FINISH RESULT
+if (String(topic) == mqttTopicFinishResult) {
+
+  Serial.println("[MQTT] Finish result reçu: " + message);
+
+  // ✅ allumer les 4 RGB
+  for (int i = 0; i < 4; i++) {
+    setRGB(i, false, true, false);
+  }
+
+  delay(3000);
+
+  // ✅ éteindre LEDs
+  for (int i = 0; i < 4; i++) {
+    setRGB(i, false, false, false);
+  }
+
+  // ── Attendre nextProjectName max 5s ─────────────
+  nextProjectName = "";
+
+  unsigned long waitNext = millis();
+
+  while (nextProjectName.length() == 0
+         && millis() - waitNext < 5000) {
+
+    client.loop();
+    yield();
+    delay(50);
+  }
+
+  Serial.println(
+    "[FINISH] nextProjectName reçu: '"
+    + nextProjectName + "'"
+  );
+
+  // ✅ afficher BMP résultat
+  if (message == "g") {
+    drawBmp("/g.bmp");
+  } else {
+    drawBmp("/h.bmp");
+  }
+
+  screenState = SCREEN_WAITING;
+
+  // ✅ afficher prochain projet
+  selectTFT();
+
+  tft.setFreeFont(&FreeSerifBoldItalic11pt7b);
+
+  tft.setTextColor(TFT_BLACK);
+
+  tft.setTextSize(1);
+
+  tft.setCursor(20, 240);
+
+  if (nextProjectName.length() > 0) {
+    tft.print(nextProjectName);
+  } else {
+    tft.print("Aucun projet");
+  }
+
+  // ✅ reset COMPLET ancien projet
+  travailEnCours = false;
+
+  projectScreenActive = false;
+  showingError = false;
+  projetNom = "";
+  tempsEstime = "";
+  nextProjectName = "";
+  projectDueTimestamp = 0;
+  // ✅ reset tâches
+  for (int i = 0; i < 4; i++) {
+    taskState[i] = 0;
+  }
+  // ✅ reset LEDs
+  disableAll();
+  // ✅ attendre écran résultat
+  unsigned long waitBmp = millis();
+  while (millis() - waitBmp < 30000) {
+    yield();
+    delay(10);
+}
+
+  // ✅ retour écran principal propre
+  showMainScreen();
+  return;
+}
+// =========================
+// NEXT PROJECT
+// =========================
+// =========================
+// NEXT PROJECT
+// =========================
+
+if (String(topic) == mqttTopicNextProject) {
+
+  nextProjectName = message;
+
+  nextProjectName.trim();
+
+  // ✅ afficher seulement pendant écran finish
+  if (screenState == SCREEN_WAITING) {
+
+    Serial.println(
+      "[NEXT PROJECT] '" +
+      nextProjectName +
+      "'"
+    );
+  }
+
+  return;
+}
+// =========================
+// PROJECT
+// =========================
+if (String(topic) == mqttTopicProject) {
+
+  int p1 = message.indexOf('|');
+  int p2 = message.indexOf('|', p1 + 1);
+
+  if (p1 < 0 || p2 < 0)
+    return;
+
+  projetNom = message.substring(0, p1);
+  tempsEstime = message.substring(p1 + 1, p2);
+
+  String statusStr = "";
+
+  int p3 = message.indexOf('|', p2 + 1);
+
+  if (p3 > 0) {
+
+    projectDueTimestamp =
+      strtoull(
+        message.substring(p2 + 1, p3).c_str(),
+        NULL,
+        10
+      );
+
+    statusStr =
+      message.substring(p3 + 1);
+
+  } else {
+
+    projectDueTimestamp =
+      strtoull(
+        message.substring(p2 + 1).c_str(),
+        NULL,
+        10
+      );
+  }
+
+  statusStr.trim();
+
+  projectIsPending =
+    (statusStr == "pending");
+
+  Serial.println(
+    "[PROJECT] " +
+    projetNom +
+    " | pending=" +
+    String(projectIsPending)
+  );
+
+  // ✅ refresh automatique TFT
+  // APRÈS
+  if (travailEnCours && projectScreenActive) {
+    // f.bmp déjà affiché → juste redessiner les données par-dessus
+    drawProjectDynamicData();
+    redrawTasksFromCache();
+  }
+  // si travailEnCours mais pas encore projectScreenActive
+  // → processPendingDecision s'en occupe via le while() ci-dessus
+  return;
+}
+}
 void ensureWifiConnected() {
   static bool wifiStarted = false;
   if (WiFi.status() == WL_CONNECTED)
@@ -643,23 +784,16 @@ void ensureWifiConnected() {
   }
 }
 
-// ============================================================
-//  Connectivité MQTT (avec back-off exponentiel) [STAB]
-// ============================================================
-
 void ensureMqttConnected() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (client.connected()) {
     mqttRetryInterval = mqttRetryMinMs;
     return;
   }
-
   unsigned long now = millis();
   if (now - lastMqttAttempt < mqttRetryInterval) return;
   lastMqttAttempt   = now;
   mqttRetryInterval = min(mqttRetryInterval * 2UL, mqttRetryMaxMs);
-
-  // MAC stable — évite les collisions de clientId sur le broker
   uint8_t mac[6];
   WiFi.macAddress(mac);
   char clientId[32];
@@ -682,7 +816,6 @@ void ensureMqttConnected() {
   "offline"
 );
   if (!ok) {
-    // Décodage du code d'erreur PubSubClient
     const char* reason = "UNKNOWN";
     switch (client.state()) {
       case -4: reason = "TIMEOUT — broker injoignable";        break;
@@ -703,21 +836,44 @@ void ensureMqttConnected() {
     return;
   }
 
-  mqttRetryInterval = mqttRetryMinMs; // reset back-off
+  // APRÈS
+  mqttRetryInterval = mqttRetryMinMs;
+
+  // ✅ Effacer tous les retained AVANT de s'abonner
+  // → empêche de recevoir un projet retained d'une session précédente
+  client.publish(mqttTopicFinishResult, "", true);
+  client.publish(mqttTopicFinish,       "", true);
+  client.publish(mqttTopicProject,      "", true);  // ← AJOUT
+  client.publish(mqttTopicTasks,        "", true);  // ← AJOUT
+  delay(150);  // ← légèrement plus long pour que le broker traite les effacements
+
   client.subscribe(mqttTopicDecision);
   client.subscribe(mqttTopicFinish);
   client.subscribe(mqttTopicProject);
   client.subscribe(mqttTopicTasks);
+  client.subscribe(mqttTopicFinishResult);
+  client.subscribe(mqttTopicNextProject);
   client.publish(mqttTopicStatus, "online", true);
-  Serial.println("[MQTT] Connected + subscribed OK");
-}
-// ============================================================
-//  Traitement de la décision reçue par MQTT
-// ============================================================
 
-// ============================================================
-//  processPendingDecision() — version corrigée et complète
-// ============================================================
+  Serial.println("[MQTT] Connected + subscribed OK");
+  client.publish(mqttTopicFinishResult, "", true);
+  client.publish(mqttTopicFinish,       "", true);
+}
+void redrawTasksFromCache() {
+  if (taskState[0] < 0) return;
+  const int YS[4] = {133, 168, 203, 238};
+  selectTFT();
+  if (taskState[0]==1) drawTaskTick(22, 133, 20, TFT_GREEN);
+  if (taskState[1]==1) drawTaskTick(22, 168, 20, TFT_GREEN);
+  if (taskState[2]==1) drawTaskTick(22, 203, 20, TFT_GREEN);
+  if (taskState[3]==1) drawTaskTick(22, 238, 20, TFT_GREEN);
+  disableAll();
+  for (int i=0; i<4; i++) setRGB(i, false, false, false);
+  if (taskState[0]==1) setRGB(0, false, false, true);
+  if (taskState[1]==1) setRGB(1, true,  false, false);
+  if (taskState[2]==1) setRGB(2, false, true,  false);
+  if (taskState[3]==1) setRGB(3, true, true, true);
+}
 void processPendingDecision() {
   if (!pendingDecision) return;
   pendingDecision = false;
@@ -738,21 +894,38 @@ void processPendingDecision() {
     else                              drawBmp("/d.bmp");
     drawResultOverlay();
 
-    // ✅ Attente non-bloquante — pendingDecision vidé à chaque itération
     unsigned long waitStart = millis();
     while (millis() - waitStart < 5000) {
       client.loop();
       updateBuzzer();
-      pendingDecision = false; // ✅ CRITIQUE : ignore tout message reçu pendant l'attente
-      yield();
+      pendingDecision = false;
     }
 
-    // ✅ Vider une dernière fois juste avant f.bmp
     pendingDecision = false;
 
-    drawBmp("/f.bmp");
-    drawProjectDynamicData();
+    // APRÈS — attendre que projetNom arrive, max 5s
+    // APRÈS (bloc ok/late) — attendre d'abord, dessiner ensuite
+    // ← attendre projetNom AVANT drawBmp (SPI libre pour client.loop)
+    // APRÈS
+    if (projetNom.length() == 0) {
+      unsigned long t = millis();
+      while (projetNom.length() == 0 && millis() - t < 5000) {
+        client.loop();
+        yield();
+        delay(50);
+      }
+    }
+    Serial.println("[FLOW] projetNom: '" + projetNom + "'");
 
+    drawBmp("/f.bmp");          // ← dessiner APRÈS avoir reçu les données
+    projectScreenActive = true;
+    projectIsPending = false;
+
+    if (projetNom.length() > 0) {
+      drawProjectDynamicData(); // ← données déjà disponibles
+    }
+    redrawTasksFromCache();
+  
     screenState        = SCREEN_RESULT;
     screenStateSince   = millis();
     travailEnCours     = true;
@@ -760,26 +933,98 @@ void processPendingDecision() {
     waitingRelease     = false;
     btn1Pressed        = false;
     btn2Pressed        = false;
-    ignoreButtonsUntil = millis() + 1000; // ✅ 1s pour absorber relâchements résiduels
+    ignoreButtonsUntil = millis() + 1000;
     lastBtn1           = digitalRead(BTN1);
     lastBtn2           = digitalRead(BTN2);
 
-  } else {
-    // "no" ou inconnu
-    drawBmp("/c.bmp");
-    startBuzzer(1000);
-    waitingRelease    = false;
-    btn1Pressed       = false;
-    btn2Pressed       = false;
-    lastBtn1          = digitalRead(BTN1);
-    lastBtn2          = digitalRead(BTN2);
-    screenState       = SCREEN_UNKNOWN;
-    screenStateSince  = millis();
-    showingError      = true;
-    errorDisplayStart = millis();
   }
+  else if (pendingDecisionState == "already") {
+
+  Serial.println("[FLOW] Deja pointe");
+
+// APRÈS (bloc already) — même logique
+  // APRÈS
+  if (projetNom.length() == 0) {
+    unsigned long t = millis();
+    while (projetNom.length() == 0 && millis() - t < 5000) {
+      client.loop();
+      yield();
+      delay(50);
+    }
+  }
+  Serial.println("[FLOW] projetNom: '" + projetNom + "'");
+
+  drawBmp("/f.bmp");
+  projectScreenActive = true;
+  projectIsPending = false;
+
+  if (projetNom.length() > 0) {
+    drawProjectDynamicData();
+  }
+  redrawTasksFromCache();
+  startBuzzer(300);
+
+  waitingRelease    = false;
+  btn1Pressed       = false;
+  btn2Pressed       = false;
+  lastBtn1          = digitalRead(BTN1);
+  lastBtn2          = digitalRead(BTN2);
+
+  screenState       = SCREEN_RESULT;
+  screenStateSince  = millis();
+  travailEnCours = true;
+  showingError   = false;
+
+  }
+  else {
+
+  drawBmp("/c.bmp");
+
+  startBuzzer(1000);
+
+  waitingRelease    = false;
+  btn1Pressed       = false;
+  btn2Pressed       = false;
+  lastBtn1          = digitalRead(BTN1);
+  lastBtn2          = digitalRead(BTN2);
+
+  screenState       = SCREEN_UNKNOWN;
+  screenStateSince  = millis();
+  showingError      = true;
+  errorDisplayStart = millis();
+  }
+  }
+  void updateProjectCountdown() {
+
+  if (!travailEnCours || !projectScreenActive)
+    return;
+
+  if (projectIsPending) {
+
+    selectTFT();
+
+    tft.fillRect(115, 98, 110, 22, 0xC638);
+
+    tft.setTextColor(TFT_BLUE);
+    tft.setFreeFont(&FreeSerifBoldItalic11pt7b);
+    tft.setCursor(118, 114);
+
+    // afficher temps estimé fixe
+    long estimatedSeconds = tempsEstime.toInt();
+
+    int days = estimatedSeconds / 86400;
+    int hours = (estimatedSeconds % 86400) / 3600;
+
+    char estBuffer[20];
+
+    sprintf(estBuffer, "%dj %dh", days, hours);
+
+    tft.print(estBuffer);
+
+    disableAll();
+
+    return;
 }
-void updateProjectCountdown() {
   if (!travailEnCours || screenState != SCREEN_RESULT)
     return;
 
@@ -795,8 +1040,18 @@ void updateProjectCountdown() {
       (long long)projectDueTimestamp -
       (long long)nowMs;
 
-  if (diff < 0)
-      diff = 0;
+  if (diff <= 0) {
+
+  tempsRestant = "00:00:00";
+  selectTFT();
+  tft.fillRect(115, 98, 110, 22, 0xC638);
+  tft.setTextColor(TFT_RED);
+  tft.setFreeFont(&FreeSerifBoldItalic11pt7b);
+  tft.setCursor(118, 114);
+  tft.print("00:00:00");
+  disableAll();
+  return;
+}
 
   long totalSeconds = diff / 1000;
 
@@ -826,7 +1081,6 @@ void updateProjectCountdown() {
 
   tft.setFreeFont(&FreeSerifBoldItalic11pt7b);
 
-  
   tft.setCursor(118, 114);
 
   tft.print(tempsRestant);
@@ -868,14 +1122,11 @@ void pollButtons() {
     return;
   }
 
-  // ✅ Fenêtre d'immunité après transition d'écran
   if (millis() < ignoreButtonsUntil) {
-    lastBtn1 = currentBtn1;   // mettre à jour silencieusement
+    lastBtn1 = currentBtn1;   
     lastBtn2 = currentBtn2;
     return;
   }
-
-  // ── Pendant travail (f.bmp) : bouton pressé → retour a.bmp ──
   if (travailEnCours) {
     bool btn1JustPressed = (lastBtn1 == BTN_RELEASED && currentBtn1 == BTN_PRESSED);
     bool btn2JustPressed = (lastBtn2 == BTN_RELEASED && currentBtn2 == BTN_PRESSED);
@@ -897,7 +1148,6 @@ void pollButtons() {
     return;
   }
 
-  // ===== BTN1 =====
   if (lastBtn1 == BTN_PRESSED && currentBtn1 == BTN_RELEASED) {
     Serial.println("[BTN1] Relâché (classeur retiré)");
     btn1Pressed = false;
@@ -997,11 +1247,9 @@ void pollRfid() {
 
   Serial.print("[RFID] UID=");
   Serial.println(uid);
-
-  // 🔒 Protection anti remplacement badge
   if (waitingRelease) {
     if (uid == lockedUid) {
-      return; // même badge → ignore
+      return; 
     }
     Serial.println("[SECURITY] Badge différent ignoré");
     return;
@@ -1018,8 +1266,6 @@ void pollRfid() {
     Serial.println("[RFID] ❌ Aucun bouton pressé");
     return;
   }
-
-  // 🔒 verrouillage
   lockedUid = uid;
   lockedButton = scannedButton;
 
@@ -1047,20 +1293,22 @@ void drawProjectDynamicData() {
   tft.setTextDatum(TL_DATUM);
 
   tft.setFreeFont(&FreeSerifBoldItalic11pt7b);
-
-  // 🔵 Temps estimé
   tft.setTextColor(TFT_BLUE);
-
   tft.setCursor(42, 58);
-  tft.print(tempsEstime);
+  if (tempsEstime.length() == 0 || projetNom.length() == 0) {
+  tft.print("...");
+  } else {
+  long estimatedSeconds = tempsEstime.toInt();
+  int days = estimatedSeconds / 86400;
+  int hours = (estimatedSeconds % 86400) / 3600;
+  char estBuffer[20];
+  sprintf(estBuffer, "%dj %dh", days, hours);
+  tft.print(estBuffer);
+}
 
-  // ⚪ Projet
-  tft.setTextColor(TFT_WHITE);
-
-  tft.setCursor(110, 86);
-  tft.print(projetNom);
-
-
+tft.setTextColor(TFT_WHITE);
+tft.setCursor(110, 86);
+tft.print(projetNom.length() == 0 ? "..." : projetNom);
   disableAll();
 }
 void updateClockOnMainScreen() {
@@ -1094,57 +1342,57 @@ void updateClockOnMainScreen() {
   lastDate = newDate;
 }
 void setRGB(int rgbIndex, bool r, bool g, bool b) {
-
-  // CATHODE COMMUNE
-  // HIGH = ON
-  // LOW  = OFF
-
   mcp.digitalWrite(rgbPins[rgbIndex][0], r ? HIGH : LOW);
   mcp.digitalWrite(rgbPins[rgbIndex][1], g ? HIGH : LOW);
   mcp.digitalWrite(rgbPins[rgbIndex][2], b ? HIGH : LOW);
 }
-// ============================================================
-//  setup()
-// ============================================================
-
 void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
 
- if (!mcp.begin_I2C()) {
-
-  Serial.println("[MCP] not found");
-
- } else {
-
-  Serial.println("[MCP] OK");
-  for (int rgb = 0; rgb < 4; rgb++) {
-
-  for (int c = 0; c < 3; c++) {
-
-    mcp.pinMode(rgbPins[rgb][c], OUTPUT);
-
-    // ✅ RGB éteint au démarrage
-    mcp.digitalWrite(rgbPins[rgb][c], LOW);
+  if (!mcp.begin_I2C()) {
+    Serial.println("[MCP] not found");
+  } else {
+    Serial.println("[MCP] OK");
+    for (int rgb = 0; rgb < 4; rgb++) {
+      for (int c = 0; c < 3; c++) {
+        mcp.pinMode(rgbPins[rgb][c], OUTPUT);
+        mcp.digitalWrite(rgbPins[rgb][c], LOW);
+      }
+    }
   }
-}
- }
-  digitalWrite(BUZZER, LOW);
-  disableAll();
 
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, LOW);
+  pinMode(SD_CS,   OUTPUT);
+  pinMode(TFT_CS,  OUTPUT);
+  pinMode(RFID_CS, OUTPUT);
+  disableAll();  // tous CS HIGH
+
+  // APRÈS — identique au code GitHub qui fonctionnait
   SPI.begin(18, 19, 23);
   SPI.setFrequency(10000000);
+
   // Init SD
+  selectSD();                   // ← AJOUT : CS SD LOW, autres HIGH
+  // Ajouter dans setup() après SD.begin() réussi
+if (SD.begin(SD_CS)) {
+  Serial.println("[SD] init ok");
+  // Test d'ouverture directe
   selectSD();
-  if (!SD.begin(SD_CS)) {
-    Serial.println("[SD] init failed");
+  File test = SD.open("/a.bmp");
+  if (test) {
+    Serial.print("[SD] Test open OK, size=");
+    Serial.println(test.size());
+    test.close();
   } else {
-    Serial.println("[SD] init ok");
+    Serial.println("[SD] Test open FAILED dans setup");
   }
   digitalWrite(SD_CS, HIGH);
+}
 
   // Init TFT
-  selectTFT();
+  selectTFT();                  // ← déjà présent, ok
   tft.init();
   SPI.end();
   delay(10);
@@ -1161,10 +1409,9 @@ void setup() {
   disableAll();
   Serial.println("[RFID] ready");
 
-  // MQTT
   client.setServer(mqtt_server, mqttPort);
-  client.setCallback(mqttCallback);   // ✅ CORRIGÉ
-  client.setBufferSize(256);
+  client.setCallback(mqttCallback);
+  client.setBufferSize(512);
   client.setKeepAlive(30);
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -1176,15 +1423,8 @@ void loop() {
   ensureWifiConnected();
   ensureMqttConnected();
   client.loop();
+  processPendingDecision();
 
-  // ✅ Ne traiter les décisions QUE si pas déjà en travail
-  if (!travailEnCours) {
-    processPendingDecision();
-  } else {
-    pendingDecision = false; // ✅ Jeter toute décision reçue pendant f.bmp
-  }
-
-  // ── Timeout bouton non relâché (30s) ─────────────────────
   if (waitingRelease && (millis() - scanTime > 30000)) {
     Serial.println("[SYSTEM] Timeout 30s — bouton non relâché");
     drawBmp("/c.bmp");
@@ -1196,7 +1436,6 @@ void loop() {
     screenStateSince  = millis();
   }
 
-  // ── Retour écran principal après erreur (5s) ──────────────
   if (showingError && !travailEnCours &&
       (millis() - errorDisplayStart > 5000)) {
     Serial.println("[SYSTEM] Retour écran principal");
