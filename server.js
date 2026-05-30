@@ -54,6 +54,7 @@ client.on('connect', () => {
   client.publish('pointage/tasks',         '', { retain: true });
   client.publish('pointage/project',       '', { retain: true });
   client.subscribe('pointage/action');
+  client.subscribe('pointage/sync');
 });
 
 // ✅ publishProjectTasks — sans finish_result
@@ -61,8 +62,9 @@ function publishProjectAndTasks(projectId) {
   db.query(
     `SELECT label, completed
 FROM tasks
-WHERE project_id = 0
+WHERE project_id = ?
 ORDER BY sort_order ASC`,
+    [projectId],
     (errTasks, taskRows) => {
       if (!errTasks) {
         const states = [0, 0, 0, 0];
@@ -79,6 +81,50 @@ ORDER BY sort_order ASC`,
 }
 
 client.on('message', (topic, message) => {
+  if (topic === 'pointage/sync') {
+
+  const userId = message.toString().trim();
+
+  console.log('[SYNC MQTT]', userId);
+
+  db.query(
+    `SELECT id, code, start_date, due_date,
+     UNIX_TIMESTAMP(due_date) as due_ts,
+     UNIX_TIMESTAMP(start_date) as start_ts,
+     status
+     FROM projects
+     WHERE user_id = ?
+     AND status IN ('progress','pending')
+     AND due_date IS NOT NULL
+     ORDER BY CASE WHEN status='progress' THEN 0 ELSE 1 END,
+     created_at ASC LIMIT 1`,
+    [userId],
+    (err, rows) => {
+
+      if (!err && rows.length > 0) {
+
+        const p = rows[0];
+
+        const deadline = p.due_ts * 1000;
+
+        const estimatedSeconds =
+          Math.abs(p.due_ts - p.start_ts);
+
+        client.publish(
+          'pointage/project',
+          `${p.code}|${estimatedSeconds}|${deadline}|${p.status}`,
+          { retain: true }
+        );
+
+        publishProjectAndTasks(p.id);
+
+        console.log('[SYNC MQTT] Projet republié');
+      }
+    }
+  );
+
+  return;
+}
   const raw = message.toString().trim();
   const parts = raw.split('|');
 

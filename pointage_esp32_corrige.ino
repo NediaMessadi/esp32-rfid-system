@@ -18,8 +18,8 @@
 #define RFID_RST 26
 #define SD_CS    33
 #define TFT_CS   5
-#define BTN_PRESSED  HIGH
-#define BTN_RELEASED LOW
+#define BTN_PRESSED  LOW
+#define BTN_RELEASED HIGH
 bool btn1Pressed = false;
 bool btn2Pressed = false;
 bool badgeScannedBtn1 = false; 
@@ -41,6 +41,7 @@ String tempsRestant = "";
 String tempsEstime = "";
 String checklistData = "";
 String nextProjectName = "";
+
 int taskState[4] = {0,0,0,0};
 String pendingTasksMessage = "";
 unsigned long lastDisplayTime = 0;
@@ -53,9 +54,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length);
 void setRGB(int rgbIndex, bool r, bool g, bool b);
 void drawProjectDynamicData();
 // ─── Réseau & MQTT ──────────────────────────────────────────
-const char* ssid          = "Cafe SEVEN Mez";
-const char* password      = "987654321";
-const char* mqtt_server = "192.168.0.241";
+const char* ssid          = "TOPNET_E24C";
+const char* password      = "RU3T39AVU2F2";
+const char* mqtt_server = "192.168.100.10";
 const uint16_t mqttPort   = 1883;
 const char* mqttTopicScan = "pointage/action";
 const char* mqttTopicButton   = "pointage/button";
@@ -67,6 +68,7 @@ const char* mqttTopicTasks = "pointage/tasks";
 const char* mqttTopicSyncReq = "pointage/sync_request";
 const char* mqttTopicFinishResult = "pointage/finish_result";
 const char* mqttTopicNextProject = "pointage/next_project";
+
 // ─── NTP ────────────────────────────────────────────────────
 const char* ntpServer        = "pool.ntp.org";
 const long  gmtOffset_sec    = 3600;
@@ -560,25 +562,17 @@ taskState[3]=f4;
 Serial.println("[TASKS] " + message);
 
 // si f.bmp pas encore affiché
-if (!projectScreenActive)
-  return;
+// APRÈS
+if (!projectScreenActive) return;
 
-const int YS[4] = {133,168,203,238};
-int vals[4] = {f1,f2,f3,f4};
+// Redessiner le BMP comme fond propre puis poser les ticks actifs
+drawBmp("/f.bmp");
+if (projetNom.length() > 0) drawProjectDynamicData();
 selectTFT();
-for (int i=0; i<4; i++) {
-  if (vals[i]==0) {
-    // effacer uniquement les cases décochées
-    uint16_t c = tft.readPixel(23, YS[i]+21);
-    c = (c >> 8) | (c << 8); // swap bytes
-   tft.fillRect(22, YS[i], 20, 20, c);
-  }
-}
 if (f1==1) drawTaskTick(22,133,20,TFT_GREEN);
 if (f2==1) drawTaskTick(22,168,20,TFT_GREEN);
 if (f3==1) drawTaskTick(22,203,20,TFT_GREEN);
 if (f4==1) drawTaskTick(22,238,20,TFT_GREEN);
-
 disableAll();
 
 // reset LEDs
@@ -859,9 +853,8 @@ void ensureMqttConnected() {
   client.publish(mqttTopicFinishResult, "", true);
   client.publish(mqttTopicFinish,       "", true);
 }
+// APRÈS — tick direct sur BMP, sans fillRect, sans carré
 void redrawTasksFromCache() {
-  if (taskState[0] < 0) return;
-  const int YS[4] = {133, 168, 203, 238};
   selectTFT();
   if (taskState[0]==1) drawTaskTick(22, 133, 20, TFT_GREEN);
   if (taskState[1]==1) drawTaskTick(22, 168, 20, TFT_GREEN);
@@ -916,15 +909,23 @@ void processPendingDecision() {
       }
     }
     Serial.println("[FLOW] projetNom: '" + projetNom + "'");
-
-    drawBmp("/f.bmp");          // ← dessiner APRÈS avoir reçu les données
+    drawBmp("/f.bmp");
     projectScreenActive = true;
     projectIsPending = false;
 
-    if (projetNom.length() > 0) {
-      drawProjectDynamicData(); // ← données déjà disponibles
-    }
-    redrawTasksFromCache();
+   drawProjectDynamicData();
+  // Attendre que les tâches arrivent si pas encore reçues
+  // APRÈS — attendre que taskState soit non-nul, max 4s
+unsigned long tWait = millis();
+while (millis() - tWait < 4000) {
+  if (taskState[0] || taskState[1] || taskState[2] || taskState[3]) break;
+  client.loop();
+  yield();
+  delay(30);
+}
+Serial.printf("[TASKS] cache final: %d %d %d %d\n",
+  taskState[0], taskState[1], taskState[2], taskState[3]);
+redrawTasksFromCache();
   
     screenState        = SCREEN_RESULT;
     screenStateSince   = millis();
@@ -954,14 +955,27 @@ void processPendingDecision() {
   }
   Serial.println("[FLOW] projetNom: '" + projetNom + "'");
 
-  drawBmp("/f.bmp");
-  projectScreenActive = true;
-  projectIsPending = false;
+  // APRÈS (bloc already)
+  // APRÈS
+   for (int i = 0; i < 4; i++) taskState[i] = 0;  // ← reset avant réception
+   drawBmp("/f.bmp");
+   projectScreenActive = true;
+   projectIsPending = false;
 
-  if (projetNom.length() > 0) {
-    drawProjectDynamicData();
-  }
-  redrawTasksFromCache();
+  drawProjectDynamicData();
+
+// Attendre que les tâches arrivent si pas encore reçues
+// APRÈS — attendre que taskState soit non-nul, max 4s
+unsigned long tWait = millis();
+while (millis() - tWait < 4000) {
+  if (taskState[0] || taskState[1] || taskState[2] || taskState[3]) break;
+  client.loop();
+  yield();
+  delay(30);
+}
+Serial.printf("[TASKS] cache final: %d %d %d %d\n",
+  taskState[0], taskState[1], taskState[2], taskState[3]);
+redrawTasksFromCache();
   startBuzzer(300);
 
   waitingRelease    = false;
@@ -1128,10 +1142,10 @@ void pollButtons() {
     return;
   }
   if (travailEnCours) {
-    bool btn1JustPressed = (lastBtn1 == BTN_RELEASED && currentBtn1 == BTN_PRESSED);
-    bool btn2JustPressed = (lastBtn2 == BTN_RELEASED && currentBtn2 == BTN_PRESSED);
+    bool btn1JustReleased =(lastBtn1 == BTN_PRESSED && currentBtn1 == BTN_RELEASED);
+    bool btn2JustReleased =(lastBtn2 == BTN_PRESSED && currentBtn2 == BTN_RELEASED);
 
-    if (btn1JustPressed || btn2JustPressed) {
+    if (btn1JustReleased || btn2JustReleased) {
       Serial.println("[BTN] Bouton pressé pendant travail → retour écran principal");
       travailEnCours = false;
       showingError   = false;
@@ -1306,7 +1320,7 @@ void drawProjectDynamicData() {
   tft.print(estBuffer);
 }
 
-tft.setTextColor(TFT_WHITE);
+tft.setTextColor(TFT_BLUE);
 tft.setCursor(110, 86);
 tft.print(projetNom.length() == 0 ? "..." : projetNom);
   disableAll();
